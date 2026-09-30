@@ -1,9 +1,10 @@
 //! A sharded queue for the blocking pool's tasks.
 //!
 //! Tasks live in `NUM_SHARDS` queues, each with its own mutex. Spawners push
-//! to a shard chosen via the thread-local RNG; workers pop by scanning the
-//! shards, starting from one derived from their worker id. A mask tracks which
-//! shards have tasks so scans rarely lock empty shards.
+//! to a shard chosen via the thread-local RNG; workers scan from a per-worker
+//! cursor, initially derived from the worker id and advanced after each
+//! successful pop. A mask tracks which shards have tasks so scans rarely lock
+//! empty shards.
 //!
 //! Worker lifecycle (thread spawning, parking/waking, timeouts, shutdown) is
 //! coordinated by the `coord` mutex + `condvar`, using the same claim
@@ -125,14 +126,14 @@ impl ShardedImpl {
         Ok(())
     }
 
-    /// Pop a task, checking the worker's preferred shard first.
-    fn pop(&self, preferred_shard: usize) -> Option<Task> {
+    /// Pop a task, checking the worker's next shard first.
+    fn pop(&self, next_shard: &mut usize) -> Option<Task> {
         let mask = self.non_empty_mask.load(Ordering::Relaxed);
         if mask == 0 {
             return None;
         }
 
-        let start = preferred_shard % NUM_SHARDS;
+        let start = *next_shard % NUM_SHARDS;
         for i in 0..NUM_SHARDS {
             let index = (start + i) % NUM_SHARDS;
             if mask & (1 << index) == 0 {
@@ -142,6 +143,7 @@ impl ShardedImpl {
             let mut shard = self.shards[index].lock();
             match shard.queue.pop_front() {
                 Some(task) => {
+                    *next_shard = (index + 1) % NUM_SHARDS;
                     if shard.queue.is_empty() {
                         self.non_empty_mask
                             .fetch_and(!(1 << index), Ordering::Relaxed);
@@ -244,10 +246,14 @@ impl ShardedImpl {
         let mut join_on_thread = None;
         let mut coord;
 
+        // Start from each worker's original shard, then advance the scan start
+        // after successful pops to avoid repeatedly preferring the same visible shard.
+        let mut next_shard = worker_thread_id % NUM_SHARDS;
+
         'main: loop {
             // BUSY: run tasks without holding `coord`, so that spawners and
             // other workers are not blocked on this worker.
-            while let Some(task) = self.pop(worker_thread_id) {
+            while let Some(task) = self.pop(&mut next_shard) {
                 metrics.dec_queue_depth();
                 task.run();
             }
@@ -262,7 +268,7 @@ impl ShardedImpl {
             // mask bit) before its `coord` critical section, so the task is
             // visible here; one that decides later sees this worker counted
             // idle and claims it.
-            if let Some(task) = self.pop(worker_thread_id) {
+            if let Some(task) = self.pop(&mut next_shard) {
                 metrics.dec_queue_depth();
                 drop(coord);
                 task.run();
@@ -349,5 +355,68 @@ impl ShardedImpl {
         }
 
         Some(handles)
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod test {
+    use super::*;
+    use crate::runtime::blocking::pool::{Mandatory, Task, ThreadManagementState};
+    use crate::runtime::blocking::schedule::BlockingSchedule;
+    use crate::runtime::task::{self, Id, SpawnLocation};
+    use crate::runtime::{blocking::BlockingTask, Builder, Handle};
+
+    fn task(handle: &Handle) -> Task {
+        let (task, _handle) = task::unowned(
+            BlockingTask::new(|| ()),
+            BlockingSchedule::new(handle),
+            Id::next(),
+            SpawnLocation::capture(),
+        );
+        Task::new(task, Mandatory::NonMandatory)
+    }
+
+    #[test]
+    fn pop_rotates_after_a_successful_pop() {
+        let runtime = Builder::new_current_thread().build().unwrap();
+        let queue = ShardedImpl::new(ThreadManagementState {
+            shutdown: false,
+            shutdown_tx: None,
+            last_exiting_thread: None,
+            worker_threads: std::collections::HashMap::new(),
+            worker_thread_index: 0,
+        });
+
+        // Keep shard 0 busy while shard 1 has work waiting. A fixed scan start
+        // would keep selecting shard 0 while it remains non-empty.
+        queue.shards[0]
+            .lock()
+            .queue
+            .push_back(task(runtime.handle()));
+        queue.shards[0]
+            .lock()
+            .queue
+            .push_back(task(runtime.handle()));
+        queue.shards[1]
+            .lock()
+            .queue
+            .push_back(task(runtime.handle()));
+        queue.non_empty_mask.store(0b11, Ordering::Relaxed);
+
+        let mut next_shard = 0;
+
+        let first = queue.pop(&mut next_shard).expect("shard 0 has work");
+        assert_eq!(queue.shards[0].lock().queue.len(), 1);
+        assert_eq!(queue.shards[1].lock().queue.len(), 1);
+        first.shutdown();
+
+        let second = queue.pop(&mut next_shard).expect("shard 1 has work");
+        assert_eq!(queue.shards[0].lock().queue.len(), 1);
+        assert!(queue.shards[1].lock().queue.is_empty());
+        second.shutdown();
+
+        let third = queue.pop(&mut next_shard).expect("shard 0 still has work");
+        assert!(queue.shards[0].lock().queue.is_empty());
+        third.shutdown();
     }
 }
